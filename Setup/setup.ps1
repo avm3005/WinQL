@@ -1,4 +1,4 @@
-# Install-WinQL.ps1 - Taskbar-Integrated Setup for WinQL v5.1.0 (Media Deadlock Fix)
+# Install-WinQL.ps1 - Taskbar-Integrated Setup for WinQL v1.0.0
 
 # --- 1. AUTOMATIC ADMINISTRATOR ELEVATION ---
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -8,7 +8,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 }
 
 Write-Host "=================================================" -ForegroundColor Cyan
-Write-Host "      WinQL Utility Installer - v5.1.0         " -ForegroundColor White
+Write-Host "      WinQL Utility Installer - v1.0.0         " -ForegroundColor White
 Write-Host "=================================================" -ForegroundColor Cyan
 Start-Sleep -Seconds 1
 
@@ -127,64 +127,72 @@ try {
 "@
     Add-Type -TypeDefinition $signature -Language CSharp
 
-    # --- Robust MTA-Isolated UWP Media Handler (Fixes STA Deadlock Bug) ---
+    # --- ISOLATED C# BACKGROUND MEDIA TRACKER ---
     try {
         $smtcSig = @"
         using System;
+        using System.Threading;
         using System.Threading.Tasks;
         using Windows.Media.Control;
         using Windows.Storage.Streams;
 
-        public class WinMedia {
+        public static class MediaTracker {
             public static string Title = "";
             public static string Artist = "";
             public static string AppId = "";
             public static byte[] ThumbBytes = null;
             public static bool IsPlaying = false;
             public static bool HasMedia = false;
+            public static bool IsRunning = false;
 
-            public static void Update() {
-                try {
-                    Task.Run(async () => {
-                        var manager = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
-                        var session = manager.GetCurrentSession();
-                        if (session == null) { HasMedia = false; return; }
-                        
-                        var info = await session.TryGetMediaPropertiesAsync();
-                        Title = info.Title;
-                        Artist = info.Artist;
-                        AppId = session.SourceAppUserModelId;
-                        
-                        var playback = session.GetPlaybackInfo();
-                        IsPlaying = playback.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing;
+            public static void Start() {
+                if (IsRunning) return;
+                IsRunning = true;
+                new Thread(async () => {
+                    while(IsRunning) {
+                        try {
+                            var manager = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
+                            var session = manager.GetCurrentSession();
+                            if (session == null) { HasMedia = false; Thread.Sleep(1000); continue; }
+                            
+                            var info = await session.TryGetMediaPropertiesAsync();
+                            Title = info.Title;
+                            Artist = info.Artist;
+                            AppId = session.SourceAppUserModelId;
+                            
+                            var playback = session.GetPlaybackInfo();
+                            IsPlaying = playback.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing;
 
-                        if (info.Thumbnail != null) {
-                            using (var stream = await info.Thumbnail.OpenReadAsync()) {
-                                var bytes = new byte[stream.Size];
-                                using (var reader = new DataReader(stream)) {
-                                    await reader.LoadAsync((uint)stream.Size);
-                                    reader.ReadBytes(bytes);
-                                    ThumbBytes = bytes;
+                            if (info.Thumbnail != null) {
+                                using (var stream = await info.Thumbnail.OpenReadAsync()) {
+                                    var bytes = new byte[stream.Size];
+                                    using (var reader = new DataReader(stream)) {
+                                        await reader.LoadAsync((uint)stream.Size);
+                                        reader.ReadBytes(bytes);
+                                        ThumbBytes = bytes;
+                                    }
                                 }
+                            } else {
+                                ThumbBytes = null;
                             }
-                        } else {
-                            ThumbBytes = null;
+                            HasMedia = true;
+                        } catch {
+                            HasMedia = false;
                         }
-                        HasMedia = true;
-                    }).Wait(400); // 400ms timeout strictly prevents the STA UI thread from permanently deadlocking
-                } catch {
-                    HasMedia = false;
-                }
+                        Thread.Sleep(1000);
+                    }
+                }) { IsBackground = true }.Start();
             }
-            
-            public static void PlayPause() { Task.Run(async () => { var m = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync(); var s = m.GetCurrentSession(); if(s != null) await s.TryTogglePlayPauseAsync(); }); }
-            public static void Next() { Task.Run(async () => { var m = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync(); var s = m.GetCurrentSession(); if(s != null) await s.TrySkipNextAsync(); }); }
-            public static void Prev() { Task.Run(async () => { var m = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync(); var s = m.GetCurrentSession(); if(s != null) await s.TrySkipPreviousAsync(); }); }
+
+            public static void PlayPause() { Task.Run(async () => { try { var m = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync(); var s = m.GetCurrentSession(); if(s != null) await s.TryTogglePlayPauseAsync(); } catch { }}); }
+            public static void Next() { Task.Run(async () => { try { var m = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync(); var s = m.GetCurrentSession(); if(s != null) await s.TrySkipNextAsync(); } catch { }}); }
+            public static void Prev() { Task.Run(async () => { try { var m = await GlobalSystemMediaTransportControlsSessionManager.RequestAsync(); var s = m.GetCurrentSession(); if(s != null) await s.TrySkipPreviousAsync(); } catch { }}); }
         }
 "@
-        $winmdPath = "$env:windir\System32\WinMetadata"
-        $refs = @("System", "System.Runtime", "System.Runtime.WindowsRuntime", "System.Threading.Tasks", "System.IO", "$winmdPath\Windows.Foundation.winmd", "$winmdPath\Windows.Media.winmd", "$winmdPath\Windows.Storage.winmd")
+        $winmdPath = [Environment]::GetFolderPath('System') + "\WinMetadata"
+        $refs = @("System.Runtime", "System.Runtime.WindowsRuntime", "System.Threading.Tasks", "System.IO", "$winmdPath\Windows.Foundation.winmd", "$winmdPath\Windows.Media.winmd", "$winmdPath\Windows.Storage.winmd")
         Add-Type -TypeDefinition $smtcSig -Language CSharp -ReferencedAssemblies $refs
+        [MediaTracker]::Start()
         $global:MediaAPIEnabled = $true
     } catch {
         $errMsg = "Media API Compilation Failed: $($_.Exception.Message)"
@@ -221,6 +229,7 @@ try {
         if (Test-Path $settingsFile) { try { $loaded = Get-Content $settingsFile -Raw | ConvertFrom-Json } catch {} }
         if ($null -eq $loaded) { $loaded = New-Object PSObject }
         
+        # Core Settings
         if ($null -eq $loaded.BtnCount) { $loaded | Add-Member -MemberType NoteProperty -Name "BtnCount" -Value 1 -Force }
         if ($null -eq $loaded.Alignment) { $loaded | Add-Member -MemberType NoteProperty -Name "Alignment" -Value "Center" -Force }
         if ($null -eq $loaded.LeftSpacing) { $loaded | Add-Member -MemberType NoteProperty -Name "LeftSpacing" -Value 10 -Force }
@@ -228,20 +237,28 @@ try {
         if ($null -eq $loaded.Spacing) { $loaded | Add-Member -MemberType NoteProperty -Name "Spacing" -Value 15 -Force }
         if ($null -eq $loaded.ButtonSize) { $loaded | Add-Member -MemberType NoteProperty -Name "ButtonSize" -Value 40 -Force }
         if ($null -eq $loaded.Orientation) { $loaded | Add-Member -MemberType NoteProperty -Name "Orientation" -Value "Horizontal" -Force }
-        if ($null -eq $loaded.FontColorMode) { $loaded | Add-Member -MemberType NoteProperty -Name "FontColorMode" -Value "Auto" -Force }
-        if ($null -eq $loaded.CustomFontColor) { $loaded | Add-Member -MemberType NoteProperty -Name "CustomFontColor" -Value "#00FF00" -Force }
         if ($null -eq $loaded.Startup) { $loaded | Add-Member -MemberType NoteProperty -Name "Startup" -Value $true -Force }
         if ($null -eq $loaded.ShowBorders) { $loaded | Add-Member -MemberType NoteProperty -Name "ShowBorders" -Value $false -Force }
         
+        # Global Font
+        if ($null -eq $loaded.FontColorMode) { $loaded | Add-Member -MemberType NoteProperty -Name "FontColorMode" -Value "Auto" -Force }
+        if ($null -eq $loaded.CustomFontColor) { $loaded | Add-Member -MemberType NoteProperty -Name "CustomFontColor" -Value "#00FF00" -Force }
+        if ($null -eq $loaded.GlobalBtnFontFamily) { $loaded | Add-Member -MemberType NoteProperty -Name "GlobalBtnFontFamily" -Value "Segoe UI" -Force }
+        if ($null -eq $loaded.GlobalBtnFontSize) { $loaded | Add-Member -MemberType NoteProperty -Name "GlobalBtnFontSize" -Value 20.0 -Force }
+        if ($null -eq $loaded.GlobalBtnFontBold) { $loaded | Add-Member -MemberType NoteProperty -Name "GlobalBtnFontBold" -Value $true -Force }
+        if ($null -eq $loaded.GlobalBtnFontItalic) { $loaded | Add-Member -MemberType NoteProperty -Name "GlobalBtnFontItalic" -Value $false -Force }
+
+        # Media Player Settings
         if ($null -eq $loaded.ShowMusicWidget) { $loaded | Add-Member -MemberType NoteProperty -Name "ShowMusicWidget" -Value $true -Force }
         if ($null -eq $loaded.ShowMusicControls) { $loaded | Add-Member -MemberType NoteProperty -Name "ShowMusicControls" -Value $true -Force }
         if ($null -eq $loaded.MusicPosition) { $loaded | Add-Member -MemberType NoteProperty -Name "MusicPosition" -Value "Right" -Force }
+        if ($null -eq $loaded.MusicHideTimeout) { $loaded | Add-Member -MemberType NoteProperty -Name "MusicHideTimeout" -Value 60 -Force }
         if ($null -eq $loaded.MusicFontFamily) { $loaded | Add-Member -MemberType NoteProperty -Name "MusicFontFamily" -Value "Segoe UI" -Force }
         if ($null -eq $loaded.MusicFontColorMode) { $loaded | Add-Member -MemberType NoteProperty -Name "MusicFontColorMode" -Value "Auto" -Force }
         if ($null -eq $loaded.MusicCustomColor) { $loaded | Add-Member -MemberType NoteProperty -Name "MusicCustomColor" -Value "#00FF00" -Force }
         
+        # Buttons
         if ($null -eq $loaded.Buttons) { $loaded | Add-Member -MemberType NoteProperty -Name "Buttons" -Value @() -Force }
-        
         $btns = @()
         for ($i=0; $i -lt 10; $i++) {
             $btn = $null
@@ -250,10 +267,6 @@ try {
             
             $defaultChar = if ($i -eq 9) { "0" } else { ($i + 1).ToString() }
             if ($null -eq $btn.Char -or $btn.Char -eq "") { $btn | Add-Member -MemberType NoteProperty -Name "Char" -Value $defaultChar -Force }
-            if ($null -eq $btn.FontFamily -or $btn.FontFamily -eq "") { $btn | Add-Member -MemberType NoteProperty -Name "FontFamily" -Value "Segoe UI" -Force }
-            if ($null -eq $btn.FontSize -or [double]$btn.FontSize -le 0) { $btn | Add-Member -MemberType NoteProperty -Name "FontSize" -Value 20.0 -Force }
-            if ($null -eq $btn.FontBold) { $btn | Add-Member -MemberType NoteProperty -Name "FontBold" -Value $true -Force }
-            if ($null -eq $btn.FontItalic) { $btn | Add-Member -MemberType NoteProperty -Name "FontItalic" -Value $false -Force }
             
             if ($null -eq $btn.EnLeft) { $btn | Add-Member -MemberType NoteProperty -Name "EnLeft" -Value $true -Force }
             if ($null -eq $btn.EnLeftDouble) { $btn | Add-Member -MemberType NoteProperty -Name "EnLeftDouble" -Value $false -Force }
@@ -275,6 +288,16 @@ try {
     
     function Save-Settings ($SettingsObj) { $SettingsObj | ConvertTo-Json -Depth 5 | Set-Content $settingsFile -Force }
     $global:Settings = Load-Settings
+
+    function Get-CurrentSongFallback {
+        try {
+            $spotify = Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object { -not [string]::IsNullOrWhiteSpace($_.MainWindowTitle) -and $_.MainWindowTitle -notmatch "^Spotify( Premium)?$" } | Select-Object -First 1
+            if ($spotify) { return @{ Title = $spotify.MainWindowTitle; Artist = ""; AppId = "spotify" } }
+            $vlc = Get-Process vlc -ErrorAction SilentlyContinue | Where-Object { -not [string]::IsNullOrWhiteSpace($_.MainWindowTitle) -and $_.MainWindowTitle -match " - VLC media player" } | Select-Object -First 1
+            if ($vlc) { return @{ Title = ($vlc.MainWindowTitle -replace " - VLC media player",""); Artist = ""; AppId = "vlc" } }
+        } catch {}
+        return $null
+    }
 
     function Execute-Action ($path) {
         if ([string]::IsNullOrWhiteSpace($path)) { return }
@@ -310,9 +333,9 @@ try {
                     "nav" { if ($val -eq "back") { [Native]::keybd_event(0xA6, 0, 1, 0); [Native]::keybd_event(0xA6, 0, 3, 0) } elseif ($val -eq "forward") { [Native]::keybd_event(0xA7, 0, 1, 0); [Native]::keybd_event(0xA7, 0, 3, 0) } }
                     "media" {
                         if ($global:MediaAPIEnabled) {
-                            if ($val -eq "play") { [WinMedia]::PlayPause() }
-                            elseif ($val -eq "next") { [WinMedia]::Next() }
-                            elseif ($val -eq "prev") { [WinMedia]::Prev() }
+                            if ($val -eq "play") { [MediaTracker]::PlayPause() }
+                            elseif ($val -eq "next") { [MediaTracker]::Next() }
+                            elseif ($val -eq "prev") { [MediaTracker]::Prev() }
                         } else {
                             if ($val -eq "play") { [Native]::keybd_event(0xB3, 0, 1, 0); [Native]::keybd_event(0xB3, 0, 3, 0) }
                             elseif ($val -eq "stop") { [Native]::keybd_event(0xB2, 0, 1, 0); [Native]::keybd_event(0xB2, 0, 3, 0) }
@@ -332,6 +355,7 @@ try {
         }
     }
 
+    # Safe Encoded UI Elements with 2-Line Support
     $uiXAML = @"
     <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
             Title="WinQL" SizeToContent="WidthAndHeight"
@@ -349,39 +373,31 @@ try {
             
             <StackPanel Name="ButtonPanel" Grid.Column="0" Grid.Row="0"/>
             
-            <Grid Name="MusicContainer" Visibility="Collapsed" Background="#01000000" Cursor="Hand" Margin="0">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="Auto"/>
-                </Grid.ColumnDefinitions>
-                
-                <Border Name="CoverBorder" Grid.Column="0" Width="38" Height="38" CornerRadius="4" Margin="0,0,8,0" Background="#22888888" VerticalAlignment="Center">
-                    <Grid>
-                        <TextBlock Name="FallbackIcon" Text="🎵" FontSize="18" VerticalAlignment="Center" HorizontalAlignment="Center" Foreground="Gray" Visibility="Collapsed"/>
-                        <Border CornerRadius="4">
-                            <Border.Background>
-                                <ImageBrush x:Name="CoverBrush" Stretch="UniformToFill"/>
-                            </Border.Background>
-                        </Border>
-                    </Grid>
-                </Border>
-                
-                <StackPanel Name="MusicInfoPanel" Grid.Column="1" VerticalAlignment="Center" Width="130">
-                    <Canvas Name="CanvasTitle" ClipToBounds="True" Height="18" Width="130">
-                        <TextBlock Name="SongTitle" FontSize="13" FontWeight="Bold" Canvas.Left="0"/>
-                    </Canvas>
-                    <Canvas Name="CanvasArtist" ClipToBounds="True" Height="16" Width="130" Margin="0,2,0,0">
-                        <TextBlock Name="SongArtist" FontSize="11" Opacity="0.8" Canvas.Left="0"/>
-                    </Canvas>
+            <Border Name="MusicContainer" Visibility="Collapsed" Background="#1AFFFFFF" CornerRadius="6" Padding="6,4" Cursor="Hand" Margin="0" VerticalAlignment="Center">
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    
+                    <Border Name="CoverBorder" Width="26" Height="26" CornerRadius="4" Margin="0,0,8,0" Visibility="Collapsed">
+                        <Border.Background>
+                            <ImageBrush x:Name="CoverBrush" Stretch="UniformToFill"/>
+                        </Border.Background>
+                    </Border>
+                    
+                    <StackPanel Name="MusicInfoPanel" VerticalAlignment="Center" Width="130" Margin="0,0,0,0">
+                        <Canvas Name="CanvasTitle" ClipToBounds="True" Height="18" Width="130">
+                            <TextBlock Name="SongTitle" FontSize="13" FontWeight="SemiBold" Canvas.Left="0" Padding="0,0,10,0"/>
+                        </Canvas>
+                        <Canvas Name="CanvasArtist" ClipToBounds="True" Height="14" Width="130" Margin="0,2,0,0">
+                            <TextBlock Name="SongArtist" FontSize="10" Opacity="0.8" Canvas.Left="0" Padding="0,0,10,0"/>
+                        </Canvas>
+                    </StackPanel>
+                    
+                    <StackPanel Name="MusicControls" Orientation="Horizontal" Visibility="Collapsed" VerticalAlignment="Center" Margin="8,0,0,0">
+                        <TextBlock Name="BtnPrev" Text="&lt;&lt;" FontSize="14" Cursor="Hand" Margin="0,0,8,0" VerticalAlignment="Center"/>
+                        <TextBlock Name="BtnPlay" Text="▶" FontSize="14" Cursor="Hand" Margin="0,0,8,0" VerticalAlignment="Center"/>
+                        <TextBlock Name="BtnNext" Text="&gt;&gt;" FontSize="14" Cursor="Hand" VerticalAlignment="Center"/>
+                    </StackPanel>
                 </StackPanel>
-                
-                <StackPanel Name="MusicControls" Grid.Column="2" Orientation="Horizontal" Visibility="Collapsed" VerticalAlignment="Center" Margin="8,0,0,0">
-                    <TextBlock Name="BtnPrev" Text="⏮" FontSize="18" Cursor="Hand" Margin="0,0,8,0" />
-                    <TextBlock Name="BtnPlay" Text="⏸" FontSize="18" Cursor="Hand" Margin="0,0,8,0" />
-                    <TextBlock Name="BtnNext" Text="⏭" FontSize="18" Cursor="Hand" />
-                </StackPanel>
-            </Grid>
+            </Border>
         </Grid>
     </Window>
 "@
@@ -531,14 +547,14 @@ try {
             
             $tb = New-Object System.Windows.Controls.TextBlock
             $tb.Text = $btnDef.Char
-            $tb.FontSize = $btnDef.FontSize
-            $tb.FontFamily = New-Object System.Windows.Media.FontFamily($btnDef.FontFamily)
+            $tb.FontSize = $global:Settings.GlobalBtnFontSize
+            $tb.FontFamily = New-Object System.Windows.Media.FontFamily($global:Settings.GlobalBtnFontFamily)
             $tb.Foreground = $fontBrush
             $tb.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
             $tb.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Center
             
-            if ($btnDef.FontBold) { $tb.FontWeight = [System.Windows.FontWeights]::Bold } else { $tb.FontWeight = [System.Windows.FontWeights]::Normal }
-            if ($btnDef.FontItalic) { $tb.FontStyle = [System.Windows.FontStyles]::Italic } else { $tb.FontStyle = [System.Windows.FontStyles]::Normal }
+            if ($global:Settings.GlobalBtnFontBold) { $tb.FontWeight = [System.Windows.FontWeights]::Bold } else { $tb.FontWeight = [System.Windows.FontWeights]::Normal }
+            if ($global:Settings.GlobalBtnFontItalic) { $tb.FontStyle = [System.Windows.FontStyles]::Italic } else { $tb.FontStyle = [System.Windows.FontStyles]::Normal }
             
             $border.Child = $tb
             
@@ -588,17 +604,6 @@ try {
             $script:ButtonPanel.Children.Add($border) | Out-Null
         }
         Update-Window-Position
-    }
-
-    function Tick-Marquee ($tb, $canvas) {
-        if ($tb.ActualWidth -gt $canvas.ActualWidth) {
-            $left = [System.Windows.Controls.Canvas]::GetLeft($tb)
-            $left -= 1.0
-            if ($left -lt -($tb.ActualWidth)) { $left = $canvas.ActualWidth }
-            [System.Windows.Controls.Canvas]::SetLeft($tb, $left)
-        } else {
-            [System.Windows.Controls.Canvas]::SetLeft($tb, 0)
-        }
     }
 
     # --- ACTION BUILDER DIALOG ---
@@ -868,6 +873,11 @@ try {
             if ($parsedSize -gt 5) { $global:Settings.ButtonSize = $parsedSize }
         } catch {}
 
+        try {
+            $parsedTimeout = [int]$script:txtMusicTimeout.Text
+            if ($parsedTimeout -ge 0) { $global:Settings.MusicHideTimeout = $parsedTimeout }
+        } catch {}
+
         for ($i=0; $i -lt 10; $i++) {
             $tab = $script:setWindow.FindName("tabBtn_$i")
             if ($i -lt $global:Settings.BtnCount) { $tab.Visibility = 'Visible' } else { $tab.Visibility = 'Collapsed' }
@@ -902,7 +912,8 @@ try {
             $global:Settings.Buttons[$i].MidActions = $mPaths
         }
         
-        $script:lastSong = ""
+        $script:lastSongTitle = ""
+        $script:lastSongArtist = ""
         Save-Settings $global:Settings
         Render-Layout
     }
@@ -924,12 +935,6 @@ try {
                         <StackPanel Margin="10">
                             <TextBlock Text="Character (1 Char):" FontWeight="Bold" Margin="0,0,0,5"/>
                             <TextBox Name="txtChar_$i" MaxLength="1" Width="50" HorizontalAlignment="Left" Margin="0,0,0,15" Padding="4" FontSize="16" FontFamily="Consolas"/>
-                            
-                            <TextBlock Text="Font Settings:" FontWeight="Bold" Margin="0,0,0,5"/>
-                            <StackPanel Orientation="Horizontal">
-                                <Button Name="btnFont_$i" Content="Choose Font..." Padding="10,4" Margin="0,0,10,0" Cursor="Hand"/>
-                                <TextBlock Name="lblFont_$i" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
-                            </StackPanel>
                         </StackPanel>
                     </TabItem>
                     <TabItem Header="Clicks">
@@ -985,10 +990,18 @@ try {
         }
 
         $setXAML = @"
-        <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Title="WinQL Settings (v5.1.0 Fix)" Height="700" Width="700" WindowStartupLocation="CenterScreen" Topmost="True" ResizeMode="NoResize">
+        <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Title="WinQL Settings (v1.0.0)" Height="750" Width="700" WindowStartupLocation="CenterScreen" Topmost="True" ResizeMode="NoResize">
             <TabControl Margin="5">
                 <TabItem Header="Appearance">
                     <StackPanel Margin="15">
+                        
+                        <TextBlock Text="Global Button Font Settings:" FontWeight="Bold" Margin="0,0,0,5"/>
+                        <Grid Margin="0,0,0,10">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                            <Button Name="btnGlobalFont" Content="Choose Font..." Padding="10,2" Margin="0,0,10,0" Cursor="Hand"/>
+                            <TextBlock Name="lblGlobalFont" Grid.Column="1" VerticalAlignment="Center" FontStyle="Italic"/>
+                        </Grid>
+
                         <TextBlock Text="Global Font Color Mode:" FontWeight="Bold" Margin="0,0,0,5"/>
                         <Grid Margin="0,0,0,15">
                             <Grid.ColumnDefinitions><ColumnDefinition Width="150"/><ColumnDefinition Width="*"/><ColumnDefinition Width="80"/></Grid.ColumnDefinitions>
@@ -1037,7 +1050,9 @@ try {
                                 </ComboBox>
                             </StackPanel>
                             <StackPanel Grid.Column="1">
-                                <CheckBox Name="chkControls" Content="Show Media Control Buttons" Margin="0,5,0,0"/>
+                                <CheckBox Name="chkControls" Content="Show Media Control Buttons" Margin="0,5,0,15"/>
+                                <TextBlock Text="Hide when paused after (seconds, 0=Instant):" Margin="0,0,0,5"/>
+                                <TextBox Name="txtMusicTimeout" Width="60" HorizontalAlignment="Left" Padding="2" Margin="0,0,0,10"/>
                             </StackPanel>
                         </Grid>
 
@@ -1115,6 +1130,9 @@ try {
         $script:pnlRightSpacing = $script:setWindow.FindName("pnlRightSpacing")
         $script:sldRightSpacing = $script:setWindow.FindName("sldRightSpacing")
 
+        $script:btnGlobalFont = $script:setWindow.FindName("btnGlobalFont")
+        $script:lblGlobalFont = $script:setWindow.FindName("lblGlobalFont")
+
         $script:sldSpacing = $script:setWindow.FindName("sldSpacing")
         $script:cmbOrientation = $script:setWindow.FindName("cmbOrientation")
         $script:cmbColor = $script:setWindow.FindName("cmbColor")
@@ -1128,6 +1146,7 @@ try {
         $script:chkSong = $script:setWindow.FindName("chkSong")
         $script:cmbMusicPos = $script:setWindow.FindName("cmbMusicPos")
         $script:chkControls = $script:setWindow.FindName("chkControls")
+        $script:txtMusicTimeout = $script:setWindow.FindName("txtMusicTimeout")
 
         $script:btnMusicFont = $script:setWindow.FindName("btnMusicFont"); $script:lblMusicFont = $script:setWindow.FindName("lblMusicFont")
         $script:cmbMusicColor = $script:setWindow.FindName("cmbMusicColor"); $script:txtMusicCustomColor = $script:setWindow.FindName("txtMusicCustomColor")
@@ -1139,6 +1158,9 @@ try {
         $script:sldLeftSpacing.Value = $global:Settings.LeftSpacing
         $script:sldRightSpacing.Value = $global:Settings.RightSpacing
         
+        $w = "Regular"; if ($global:Settings.GlobalBtnFontBold) { $w = "Bold" }
+        $script:lblGlobalFont.Text = "$($global:Settings.GlobalBtnFontFamily), $($global:Settings.GlobalBtnFontSize)pt, $w"
+
         $script:sldSpacing.Value = $global:Settings.Spacing
         $script:cmbOrientation.Text = $global:Settings.Orientation
         $script:cmbColor.Text = $global:Settings.FontColorMode; $script:txtCustomColor.Text = $global:Settings.CustomFontColor
@@ -1150,6 +1172,7 @@ try {
         $script:chkSong.IsChecked = $global:Settings.ShowMusicWidget
         $script:cmbMusicPos.Text = $global:Settings.MusicPosition
         $script:chkControls.IsChecked = $global:Settings.ShowMusicControls
+        $script:txtMusicTimeout.Text = $global:Settings.MusicHideTimeout
         
         $script:lblMusicFont.Text = $global:Settings.MusicFontFamily
         $script:cmbMusicColor.Text = $global:Settings.MusicFontColorMode; $script:txtMusicCustomColor.Text = $global:Settings.MusicCustomColor
@@ -1172,41 +1195,12 @@ try {
             $chkR = $script:setWindow.FindName("chkRight_$i"); $chkR.IsChecked = $def.EnRight
             $chkRD = $script:setWindow.FindName("chkRightDouble_$i"); $chkRD.IsChecked = $def.EnRightDouble
             $chkM = $script:setWindow.FindName("chkMid_$i"); $chkM.IsChecked = $def.EnMid
-            
-            $lbl = $script:setWindow.FindName("lblFont_$i")
-            $w = "Regular"; if ($def.FontBold) { $w = "Bold" }
-            $lbl.Text = "$($def.FontFamily), $($def.FontSize)pt, $w"
 
             $boxL = $script:setWindow.FindName("boxLeft_$i"); if ($def.LeftActions.Count -gt 0) { foreach($p in $def.LeftActions) { Add-ActionTextBox $boxL $p } }
             $boxLD = $script:setWindow.FindName("boxLeftDouble_$i"); if ($def.LeftDoubleActions.Count -gt 0) { foreach($p in $def.LeftDoubleActions) { Add-ActionTextBox $boxLD $p } }
             $boxR = $script:setWindow.FindName("boxRight_$i"); if ($def.RightActions.Count -gt 0) { foreach($p in $def.RightActions) { Add-ActionTextBox $boxR $p } }
             $boxRD = $script:setWindow.FindName("boxRightDouble_$i"); if ($def.RightDoubleActions.Count -gt 0) { foreach($p in $def.RightDoubleActions) { Add-ActionTextBox $boxRD $p } }
             $boxM = $script:setWindow.FindName("boxMid_$i"); if ($def.MidActions.Count -gt 0) { foreach($p in $def.MidActions) { Add-ActionTextBox $boxM $p } }
-
-            $btnFont = $script:setWindow.FindName("btnFont_$i")
-            $btnFont.Tag = $i
-            $btnFont.Add_Click({
-                param($sender, $e)
-                $idx = $sender.Tag
-                $dlg = New-Object System.Windows.Forms.FontDialog
-                try {
-                    $fStyle = [System.Drawing.FontStyle]::Regular
-                    if ($global:Settings.Buttons[$idx].FontBold) { $fStyle = $fStyle -bor [System.Drawing.FontStyle]::Bold }
-                    if ($global:Settings.Buttons[$idx].FontItalic) { $fStyle = $fStyle -bor [System.Drawing.FontStyle]::Italic }
-                    $dlg.Font = New-Object System.Drawing.Font($global:Settings.Buttons[$idx].FontFamily, [float]$global:Settings.Buttons[$idx].FontSize, $fStyle)
-                } catch {}
-                
-                if ($dlg.ShowDialog() -eq 'OK') {
-                    $global:Settings.Buttons[$idx].FontFamily = $dlg.Font.Name
-                    $global:Settings.Buttons[$idx].FontSize = $dlg.Font.Size
-                    $global:Settings.Buttons[$idx].FontBold = $dlg.Font.Bold
-                    $global:Settings.Buttons[$idx].FontItalic = $dlg.Font.Italic
-                    
-                    $w = "Regular"; if ($dlg.Font.Bold) { $w = "Bold" }
-                    $script:setWindow.FindName("lblFont_$idx").Text = "$($dlg.Font.Name), $($dlg.Font.Size)pt, $w"
-                    & $script:updateAction
-                }
-            })
 
             $script:setWindow.FindName("btnAddLeft_$i").Tag = $boxL; $script:setWindow.FindName("btnAddLeft_$i").Add_Click({ param($sender, $e) Add-ActionTextBox $sender.Tag ""; & $script:updateAction })
             $script:setWindow.FindName("btnAddLeftDouble_$i").Tag = $boxLD; $script:setWindow.FindName("btnAddLeftDouble_$i").Add_Click({ param($sender, $e) Add-ActionTextBox $sender.Tag ""; & $script:updateAction })
@@ -1217,6 +1211,26 @@ try {
             $script:setWindow.FindName("txtChar_$i").Add_TextChanged($script:updateAction)
             $chkL.Add_Click($script:updateAction); $chkLD.Add_Click($script:updateAction); $chkR.Add_Click($script:updateAction); $chkRD.Add_Click($script:updateAction); $chkM.Add_Click($script:updateAction)
         }
+
+        $script:btnGlobalFont.Add_Click({
+            $dlg = New-Object System.Windows.Forms.FontDialog
+            try {
+                $fStyle = [System.Drawing.FontStyle]::Regular
+                if ($global:Settings.GlobalBtnFontBold) { $fStyle = $fStyle -bor [System.Drawing.FontStyle]::Bold }
+                if ($global:Settings.GlobalBtnFontItalic) { $fStyle = $fStyle -bor [System.Drawing.FontStyle]::Italic }
+                $dlg.Font = New-Object System.Drawing.Font($global:Settings.GlobalBtnFontFamily, [float]$global:Settings.GlobalBtnFontSize, $fStyle)
+            } catch {}
+            if ($dlg.ShowDialog() -eq 'OK') {
+                $global:Settings.GlobalBtnFontFamily = $dlg.Font.Name
+                $global:Settings.GlobalBtnFontSize = $dlg.Font.Size
+                $global:Settings.GlobalBtnFontBold = $dlg.Font.Bold
+                $global:Settings.GlobalBtnFontItalic = $dlg.Font.Italic
+                
+                $w = "Regular"; if ($dlg.Font.Bold) { $w = "Bold" }
+                $script:lblGlobalFont.Text = "$($dlg.Font.Name), $($dlg.Font.Size)pt, $w"
+                & $script:updateAction
+            }
+        })
 
         $script:btnMusicFont.Add_Click({
             $dlg = New-Object System.Windows.Forms.FontDialog
@@ -1313,6 +1327,7 @@ try {
         $script:chkBorders.Add_Click($script:updateAction)
         $script:chkSong.Add_Click($script:updateAction)
         $script:chkControls.Add_Click($script:updateAction)
+        $script:txtMusicTimeout.Add_TextChanged($script:updateAction)
 
         $script:setWindow.Add_Closed({ $script:isSettingsOpen = $false; [Native]::TrimMemory() })
         
@@ -1327,7 +1342,7 @@ try {
     
     $global:sysTray = New-Object System.Windows.Forms.NotifyIcon
     try { $global:sysTray.Icon = New-Object System.Drawing.Icon("C:\Program Files\Detaroxz\WinQL\icon.ico") } catch { $global:sysTray.Icon = [System.Drawing.SystemIcons]::Application }
-    $global:sysTray.Text = "WinQL v5.1.0"
+    $global:sysTray.Text = "WinQL v1.0.0"
     $global:sysTray.Visible = $true
     
     $contextMenu = New-Object System.Windows.Forms.ContextMenuStrip
@@ -1336,6 +1351,7 @@ try {
         $global:keepRunning = $false
         $global:sysTray.Visible = $false
         $global:sysTray.Dispose()
+        if ($null -ne $script:renderingDelegate) { try { [System.Windows.Media.CompositionTarget]::remove_Rendering($script:renderingDelegate) } catch {} }
         if ($null -ne $script:window) { $script:window.Close() }
         if ($null -ne $script:dispatcher) { $script:dispatcher.InvokeShutdown() }
     })
@@ -1358,7 +1374,6 @@ try {
         $script:MusicContainer = $script:window.FindName("MusicContainer")
         $script:CoverBorder = $script:window.FindName("CoverBorder")
         $script:CoverBrush = $script:window.FindName("CoverBrush")
-        $script:FallbackIcon = $script:window.FindName("FallbackIcon")
         
         $script:CanvasTitle = $script:window.FindName("CanvasTitle")
         $script:SongTitle = $script:window.FindName("SongTitle")
@@ -1373,20 +1388,20 @@ try {
         # Fuzzy Source App Switching on Click
         $script:MusicContainer.Add_MouseUp({
             param($sender, $e)
-            if (-not $global:MediaAPIEnabled -or [string]::IsNullOrWhiteSpace([WinMedia]::AppId)) { return }
-            
-            $appId = [WinMedia]::AppId.ToLower()
-            $searchTerm = $appId -replace '\.exe$','' -replace '!.*$',''
-            if ($searchTerm -match '\.') { $searchTerm = $searchTerm.Split('.')[-1] }
-            
-            # Common overrides for UWP IDs
-            if ($appId -match "spotify") { $p = Get-Process Spotify -ErrorAction SilentlyContinue | Select-Object -First 1 }
-            elseif ($appId -match "chrome") { $p = Get-Process chrome -ErrorAction SilentlyContinue | Select-Object -First 1 }
-            elseif ($appId -match "msedge") { $p = Get-Process msedge -ErrorAction SilentlyContinue | Select-Object -First 1 }
-            elseif ($appId -match "vlc") { $p = Get-Process vlc -ErrorAction SilentlyContinue | Select-Object -First 1 }
-            else { 
-                $p = Get-Process | Where-Object { -not [string]::IsNullOrWhiteSpace($_.MainWindowTitle) -and ($_.ProcessName.ToLower() -match $searchTerm -or $appId -match $_.ProcessName.ToLower()) } | Select-Object -First 1
-                if (-not $p) { $p = Get-Process | Where-Object { $_.MainWindowTitle -ne "" } | Select-Object -First 1 }
+            if ($global:MediaAPIEnabled -and -not [string]::IsNullOrWhiteSpace([MediaTracker]::AppId)) {
+                $appId = [MediaTracker]::AppId.ToLower()
+                $searchTerm = $appId -replace '\.exe$','' -replace '!.*$',''
+                if ($searchTerm -match '\.') { $searchTerm = $searchTerm.Split('.')[-1] }
+                
+                if ($appId -match "spotify") { $p = Get-Process Spotify -ErrorAction SilentlyContinue | Select-Object -First 1 }
+                elseif ($appId -match "chrome") { $p = Get-Process chrome -ErrorAction SilentlyContinue | Select-Object -First 1 }
+                elseif ($appId -match "msedge") { $p = Get-Process msedge -ErrorAction SilentlyContinue | Select-Object -First 1 }
+                elseif ($appId -match "vlc") { $p = Get-Process vlc -ErrorAction SilentlyContinue | Select-Object -First 1 }
+                else { 
+                    $p = Get-Process | Where-Object { -not [string]::IsNullOrWhiteSpace($_.MainWindowTitle) -and ($_.ProcessName.ToLower() -match $searchTerm -or $appId -match $_.ProcessName.ToLower()) } | Select-Object -First 1
+                }
+            } else {
+                $p = Get-Process | Where-Object { -not [string]::IsNullOrWhiteSpace($_.MainWindowTitle) -and ($_.ProcessName -match "Spotify" -or $_.ProcessName -match "vlc") } | Select-Object -First 1
             }
             
             if ($p) {
@@ -1395,9 +1410,9 @@ try {
             }
         })
 
-        $script:BtnPrev.Add_PreviewMouseLeftButtonDown({ param($sender, $e) if ($global:MediaAPIEnabled) { [WinMedia]::Prev() }; $e.Handled = $true })
-        $script:BtnPlay.Add_PreviewMouseLeftButtonDown({ param($sender, $e) if ($global:MediaAPIEnabled) { [WinMedia]::PlayPause() }; $e.Handled = $true })
-        $script:BtnNext.Add_PreviewMouseLeftButtonDown({ param($sender, $e) if ($global:MediaAPIEnabled) { [WinMedia]::Next() }; $e.Handled = $true })
+        $script:BtnPrev.Add_PreviewMouseLeftButtonDown({ param($sender, $e) Execute-Action "<media:prev>"; $e.Handled = $true })
+        $script:BtnPlay.Add_PreviewMouseLeftButtonDown({ param($sender, $e) Execute-Action "<media:play>"; $e.Handled = $true })
+        $script:BtnNext.Add_PreviewMouseLeftButtonDown({ param($sender, $e) Execute-Action "<media:next>"; $e.Handled = $true })
 
         $script:window.Add_Loaded({
             $script:hwnd = (New-Object System.Windows.Interop.WindowInteropHelper($script:window)).Handle
@@ -1413,6 +1428,7 @@ try {
             $script:hookDelegate = [System.Windows.Interop.HwndSourceHook]{
                 param([IntPtr]$hwnd, [int]$msg, [IntPtr]$wParam, [IntPtr]$lParam, [ref]$handled)
                 if ($msg -eq [Native]::WM_TASKBARCREATED) {
+                    if ($null -ne $script:renderingDelegate) { try { [System.Windows.Media.CompositionTarget]::remove_Rendering($script:renderingDelegate) } catch {} }
                     if ($null -ne $script:window) { $script:window.Close() }
                     if ($null -ne $script:dispatcher) { $script:dispatcher.InvokeShutdown() }
                 }
@@ -1425,39 +1441,124 @@ try {
             Render-Layout
         })
 
-        $marqueeTimer = New-Object System.Windows.Threading.DispatcherTimer
-        $marqueeTimer.Interval = [TimeSpan]::FromMilliseconds(50) 
+        # --- NATIVE REFRESH RATE SYNCED MARQUEE (DWM Hook) ---
+        $script:lastRenderTime = [TimeSpan]::Zero
+        $script:marqueeSpeed = 35.0 # Pixels per second
         
+        $script:renderingDelegate = [System.EventHandler]{
+            param($sender, $e)
+            if ($script:MusicContainer.Visibility -ne 'Visible') { return }
+            
+            $currentTime = $e.RenderingTime
+            if ($script:lastRenderTime -eq [TimeSpan]::Zero) {
+                $script:lastRenderTime = $currentTime
+                return
+            }
+            
+            $dt = ($currentTime - $script:lastRenderTime).TotalSeconds
+            $script:lastRenderTime = $currentTime
+            if ($dt -gt 0.1) { $dt = 0.1 } # Cap massive skips on system lag
+            
+            if ($script:SongTitle.ActualWidth -gt $script:CanvasTitle.ActualWidth) {
+                $left = [System.Windows.Controls.Canvas]::GetLeft($script:SongTitle)
+                if ([double]::IsNaN($left)) { $left = 0 }
+                $left -= ($script:marqueeSpeed * $dt)
+                if ($left -lt -($script:SongTitle.ActualWidth)) { $left = $script:CanvasTitle.ActualWidth }
+                [System.Windows.Controls.Canvas]::SetLeft($script:SongTitle, $left)
+            } else {
+                [System.Windows.Controls.Canvas]::SetLeft($script:SongTitle, 0)
+            }
+
+            if ($script:SongArtist.ActualWidth -gt $script:CanvasArtist.ActualWidth) {
+                $left = [System.Windows.Controls.Canvas]::GetLeft($script:SongArtist)
+                if ([double]::IsNaN($left)) { $left = 0 }
+                $left -= ($script:marqueeSpeed * $dt)
+                if ($left -lt -($script:SongArtist.ActualWidth)) { $left = $script:CanvasArtist.ActualWidth }
+                [System.Windows.Controls.Canvas]::SetLeft($script:SongArtist, $left)
+            } else {
+                [System.Windows.Controls.Canvas]::SetLeft($script:SongArtist, 0)
+            }
+        }
+        [System.Windows.Media.CompositionTarget]::add_Rendering($script:renderingDelegate)
+
+        # Main Logic Poller
         $updateTimer = New-Object System.Windows.Threading.DispatcherTimer
         $updateTimer.Interval = [TimeSpan]::FromMilliseconds(1000) 
         $script:tickCount = 0
-        $script:lastSong = ""
         
-        $marqueeTimer.Add_Tick({
-            if ($script:MusicContainer.Visibility -eq 'Visible') {
-                Tick-Marquee $script:SongTitle $script:CanvasTitle
-                Tick-Marquee $script:SongArtist $script:CanvasArtist
-            }
-        })
-
+        $script:lastSongTitle = ""
+        $script:lastSongArtist = ""
+        $script:pausedSeconds = 0
+        
         $updateTimer.Add_Tick({
             $script:tickCount++
 
-            if ($global:Settings.ShowMusicWidget -and $global:MediaAPIEnabled) {
-                [WinMedia]::Update()
-                if ([WinMedia]::HasMedia -and -not [string]::IsNullOrWhiteSpace([WinMedia]::Title)) {
-                    $song = [WinMedia]::Title
-                    if ($song -ne $script:lastSong) {
-                        $script:lastSong = $song
-                        $script:SongTitle.Text = $song
-                        $script:SongArtist.Text = [WinMedia]::Artist
+            if ($global:Settings.ShowMusicWidget) {
+                $hasMedia = $false
+                $songTitle = ""
+                $songArtist = ""
+                $isPlaying = $false
+
+                if ($global:MediaAPIEnabled -and [MediaTracker]::HasMedia) {
+                    $hasMedia = $true
+                    $songTitle = [MediaTracker]::Title
+                    $songArtist = [MediaTracker]::Artist
+                    $isPlaying = [MediaTracker]::IsPlaying
+                } else {
+                    $fb = Get-CurrentSongFallback
+                    if ($fb) {
+                        $hasMedia = $true
+                        $songTitle = $fb.Title
+                        $songArtist = $fb.Artist
+                        $isPlaying = $true 
+                    }
+                }
+
+                $shouldShow = $false
+
+                if ($hasMedia -and -not [string]::IsNullOrWhiteSpace($songTitle)) {
+                    # Reset timeout if song is actively playing OR song changed
+                    if ($isPlaying -or ($songTitle -ne $script:lastSongTitle)) { 
+                        $script:pausedSeconds = 0 
+                    } else { 
+                        $script:pausedSeconds++ 
+                    }
+
+                    if ($isPlaying) {
+                        $shouldShow = $true
+                    } else {
+                        if ($global:Settings.MusicHideTimeout -eq 0) {
+                            $shouldShow = $false # Hide instantly
+                        } elseif ($script:pausedSeconds -ge $global:Settings.MusicHideTimeout) {
+                            $shouldShow = $false # Hide after timeout
+                        } else {
+                            $shouldShow = $true # Keep showing until timeout
+                        }
+                    }
+                } else {
+                    $script:pausedSeconds = 0
+                }
+
+                if ($shouldShow) {
+                    if ($songTitle -ne $script:lastSongTitle -or $songArtist -ne $script:lastSongArtist) {
+                        $script:lastSongTitle = $songTitle
+                        $script:lastSongArtist = $songArtist
                         
+                        $script:SongTitle.Text = $songTitle
+                        $script:SongArtist.Text = $songArtist
+                        
+                        if ([string]::IsNullOrWhiteSpace($songArtist)) {
+                            $script:CanvasArtist.Visibility = 'Collapsed'
+                        } else {
+                            $script:CanvasArtist.Visibility = 'Visible'
+                        }
+
                         [System.Windows.Controls.Canvas]::SetLeft($script:SongTitle, 0)
                         [System.Windows.Controls.Canvas]::SetLeft($script:SongArtist, 0)
 
-                        if ($null -ne [WinMedia]::ThumbBytes) {
+                        if ($global:MediaAPIEnabled -and $null -ne [MediaTracker]::ThumbBytes) {
                             try {
-                                $ms = New-Object System.IO.MemoryStream(,[byte[]][WinMedia]::ThumbBytes)
+                                $ms = New-Object System.IO.MemoryStream(,[byte[]][MediaTracker]::ThumbBytes)
                                 $bmp = New-Object System.Windows.Media.Imaging.BitmapImage
                                 $bmp.BeginInit()
                                 $bmp.StreamSource = $ms
@@ -1465,42 +1566,30 @@ try {
                                 $bmp.EndInit()
                                 $bmp.Freeze()
                                 $script:CoverBrush.ImageSource = $bmp
+                                $script:CoverBorder.Visibility = 'Visible'
                                 $script:CoverBorder.Background = [System.Windows.Media.Brushes]::Transparent
-                                $script:FallbackIcon.Visibility = 'Collapsed'
                                 $ms.Dispose()
                             } catch {}
                         } else {
                             $script:CoverBrush.ImageSource = $null
-                            $brushConv = New-Object System.Windows.Media.BrushConverter
-                            $script:CoverBorder.Background = $brushConv.ConvertFromString("#22888888")
-                            $script:FallbackIcon.Visibility = 'Visible'
+                            $script:CoverBorder.Visibility = 'Collapsed' 
                         }
 
                         $brushConv = New-Object System.Windows.Media.BrushConverter
                         if ($global:Settings.MusicFontColorMode -eq "Random") {
                             $rc = "#$((Get-Random -Min 100 -Max 255).ToString('X2'))$((Get-Random -Min 100 -Max 255).ToString('X2'))$((Get-Random -Min 100 -Max 255).ToString('X2'))"
                             $brush = $brushConv.ConvertFromString($rc)
-                            $script:SongTitle.Foreground = $brush; $script:SongArtist.Foreground = $brush
-                            $script:BtnPrev.Foreground = $brush; $script:BtnPlay.Foreground = $brush; $script:BtnNext.Foreground = $brush
-                        } elseif ($global:Settings.MusicFontColorMode -eq "White") { 
-                            $brush = $brushConv.ConvertFromString("#FFFFFF")
-                            $script:SongTitle.Foreground = $brush; $script:SongArtist.Foreground = $brush
-                            $script:BtnPrev.Foreground = $brush; $script:BtnPlay.Foreground = $brush; $script:BtnNext.Foreground = $brush
-                        } elseif ($global:Settings.MusicFontColorMode -eq "Black") { 
-                            $brush = $brushConv.ConvertFromString("#000000")
-                            $script:SongTitle.Foreground = $brush; $script:SongArtist.Foreground = $brush
-                            $script:BtnPrev.Foreground = $brush; $script:BtnPlay.Foreground = $brush; $script:BtnNext.Foreground = $brush
-                        } elseif ($global:Settings.MusicFontColorMode -eq "Custom") { 
-                            try { $brush = $brushConv.ConvertFromString($global:Settings.MusicCustomColor) } catch { $brush = [System.Windows.Media.Brushes]::White }
-                            $script:SongTitle.Foreground = $brush; $script:SongArtist.Foreground = $brush
-                            $script:BtnPrev.Foreground = $brush; $script:BtnPlay.Foreground = $brush; $script:BtnNext.Foreground = $brush
-                        } else { 
-                            try { $brush = $brushConv.ConvertFromString((Get-ThemeColor)) } catch { $brush = [System.Windows.Media.Brushes]::White }
-                            $script:SongTitle.Foreground = $brush; $script:SongArtist.Foreground = $brush
-                            $script:BtnPrev.Foreground = $brush; $script:BtnPlay.Foreground = $brush; $script:BtnNext.Foreground = $brush
-                        }
+                        } elseif ($global:Settings.MusicFontColorMode -eq "White") { $brush = $brushConv.ConvertFromString("#FFFFFF") } 
+                        elseif ($global:Settings.MusicFontColorMode -eq "Black") { $brush = $brushConv.ConvertFromString("#000000") } 
+                        elseif ($global:Settings.MusicFontColorMode -eq "Custom") { try { $brush = $brushConv.ConvertFromString($global:Settings.MusicCustomColor) } catch { $brush = [System.Windows.Media.Brushes]::White } } 
+                        else { try { $brush = $brushConv.ConvertFromString((Get-ThemeColor)) } catch { $brush = [System.Windows.Media.Brushes]::White } }
+                        
+                        $script:SongTitle.Foreground = $brush
+                        $script:SongArtist.Foreground = $brush
+                        $script:BtnPrev.Foreground = $brush; $script:BtnPlay.Foreground = $brush; $script:BtnNext.Foreground = $brush
                     }
-                    if ([WinMedia]::IsPlaying) { $script:BtnPlay.Text = "⏸" } else { $script:BtnPlay.Text = "▶" }
+                    
+                    if ($isPlaying) { $script:BtnPlay.Text = "||" } else { $script:BtnPlay.Text = "▶" }
                     
                     if ($script:MusicContainer.Visibility -ne 'Visible') {
                         $script:MusicContainer.Visibility = 'Visible'
@@ -1509,11 +1598,13 @@ try {
                 } else {
                     if ($script:MusicContainer.Visibility -ne 'Collapsed') {
                         $script:MusicContainer.Visibility = 'Collapsed'
-                        $script:lastSong = ""
+                        $script:lastSongTitle = ""
+                        $script:lastSongArtist = ""
                         Update-Window-Position
                     }
                 }
             } else {
+                $script:pausedSeconds = 0
                 if ($script:MusicContainer.Visibility -ne 'Collapsed') {
                     $script:MusicContainer.Visibility = 'Collapsed'
                     Update-Window-Position
@@ -1530,15 +1621,14 @@ try {
             if ($script:tickCount -ge 20) { $script:tickCount = 0; [Native]::TrimMemory() }
         })
         
-        $marqueeTimer.Start()
         $updateTimer.Start()
 
         $script:window.Show()
         $script:dispatcher = [System.Windows.Threading.Dispatcher]::CurrentDispatcher
         [System.Windows.Threading.Dispatcher]::Run()
 
-        $marqueeTimer.Stop()
         $updateTimer.Stop()
+        if ($null -ne $script:renderingDelegate) { try { [System.Windows.Media.CompositionTarget]::remove_Rendering($script:renderingDelegate) } catch {} }
         if ($global:keepRunning) { Start-Sleep -Seconds 2 } 
     }
 } catch {
@@ -1581,7 +1671,7 @@ $shortcutStart.Save()
 $regPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\WinQL"
 if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
 Set-ItemProperty -Path $regPath -Name "DisplayName" -Value "WinQL"
-Set-ItemProperty -Path $regPath -Name "DisplayVersion" -Value "5.1.0"
+Set-ItemProperty -Path $regPath -Name "DisplayVersion" -Value "1.0.0"
 Set-ItemProperty -Path $regPath -Name "Publisher" -Value "Detaroxz"
 Set-ItemProperty -Path $regPath -Name "DisplayIcon" -Value "C:\Program Files\Detaroxz\WinQL\icon.ico"
 Set-ItemProperty -Path $regPath -Name "UninstallString" -Value "powershell.exe -Sta -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installDir\Uninstall.ps1`""
