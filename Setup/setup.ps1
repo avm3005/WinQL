@@ -160,6 +160,7 @@ try {
             private static GlobalSystemMediaTransportControlsSessionManager _manager;
 
             public static int SessionTarget = -1;
+            private static string _lastOsSessionId = "";
 
             public static void CycleSession() {
                 if (_manager != null) {
@@ -177,13 +178,31 @@ try {
             private static GlobalSystemMediaTransportControlsSession GetTargetSession() {
                 if (_manager == null) return null;
                 var sessions = _manager.GetSessions();
-                if (sessions.Count == 0) { SessionTarget = -1; return null; }
+                if (sessions.Count == 0) { SessionTarget = -1; _lastOsSessionId = ""; return null; }
                 
+                var current = _manager.GetCurrentSession();
+                string currentId = current != null ? current.SourceAppUserModelId : "";
+                
+                // Auto-switch when Windows promotes a new media session to active
+                if (!string.IsNullOrEmpty(currentId) && currentId != _lastOsSessionId) {
+                    _lastOsSessionId = currentId;
+                    for (int i = 0; i < sessions.Count; i++) {
+                        if (sessions[i].SourceAppUserModelId == currentId) {
+                            if (SessionTarget != i) {
+                                SessionTarget = i;
+                                lock(_stateLock) { _lastTrackId = ""; _thumbnailBytes = null; }
+                            }
+                            return current;
+                        }
+                    }
+                }
+                
+                _lastOsSessionId = currentId;
+
                 if (SessionTarget == -1 || SessionTarget >= sessions.Count) {
-                    var current = _manager.GetCurrentSession();
                     if (current != null) {
                         for (int i=0; i<sessions.Count; i++) {
-                            if (sessions[i].SourceAppUserModelId == current.SourceAppUserModelId) {
+                            if (sessions[i].SourceAppUserModelId == currentId) {
                                 SessionTarget = i;
                                 return current;
                             }
